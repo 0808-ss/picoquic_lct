@@ -78,6 +78,7 @@ endif()
 set(PICOQUIC_LIBRARY_FILES
     picoquic/bbr.c
     picoquic/bbr1.c
+    picoquic/bbr_lct.c
     picoquic/bytestream.c
     picoquic/cc_common.c
     picoquic/config.c
@@ -133,6 +134,7 @@ set(PICOQUIC_CORE_HEADERS
      picoquic/picoquic_cubic.h
      picoquic/picoquic_bbr.h
      picoquic/picoquic_bbr1.h
+     picoquic/picoquic_bbr_lct.h
      picoquic/picoquic_fastcc.h
      picoquic/picoquic_prague.h
      picoquic/c4.h
