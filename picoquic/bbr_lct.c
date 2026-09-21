@@ -1237,12 +1237,16 @@ static void BBRUpdateMaxBw(picoquic_bbr_state_t* bbr_state, picoquic_path_t* pat
             bbr_state->MaxBwFilter, rs->delivery_rate, bbr_state->cycle_count, BBRMaxBwFilterLen);
     }
 
-    /* bbr_lct: feed the delivery-rate sample to the Holt-Winters
-     * bandwidth predictor. App-limited samples are excluded, since they
-     * understate the bottleneck bandwidth and would skew the level. */
-    if (!rs->is_app_limited) {
-        BBR_LCT_UpdateBwPrediction(bbr_state, (double)rs->delivery_rate);
-    }
+    /* bbr_lct: feed the *filtered* bottleneck-bandwidth estimate
+     * (max_bw, the windowed max of the delivery-rate samples) to the
+     * Holt-Winters bandwidth predictor. Feeding the raw per-ACK
+     * delivery-rate samples would let ack bursts, jitter and the low
+     * fallback samples drag the predictor level below the real
+     * bottleneck bandwidth -- BBR's internal logic is peak-based, and
+     * the windowed max keeps only the cycle peaks. max_bw is BBR's
+     * filtered bottleneck estimate, matching the bandwidth_estimate
+     * input consumed by the LCT trend predictor. */
+    BBR_LCT_UpdateBwPrediction(bbr_state, (double)bbr_state->max_bw);
 }
 
 static void BBRAdvanceMaxBwFilter(picoquic_bbr_state_t* bbr_state)
@@ -1511,19 +1515,15 @@ static void BBRUpdateMinRTT(picoquic_bbr_state_t* bbr_state, picoquic_path_t* pa
         bbr_state->nb_rtt_excess = 0;
     }
 
-    /* bbr_lct: update the Holt-Winters RTT prediction and use the
-     * predicted RTT as an early queue-growth signal. A predicted RTT
-     * that keeps rising significantly above the minimum RTT is treated
-     * as the early sign of queue buildup, before losses or ECN marks
-     * are observed. */
+    /* bbr_lct: update the Holt-Winters RTT prediction state only.
+     * The predicted RTT is deliberately NOT used to drive
+     * nb_rtt_excess: with the jitter levels of the testbed (5-15 ms),
+     * the predictor trend is almost always non-zero and rtt_predicted
+     * sits persistently above min_rtt, which inflated nb_rtt_excess
+     * and prematurely ended startup / probe_bw_up. The excess counter
+     * keeps BBR's original semantics based on rtt_short_term_min
+     * (see the check above). */
     BBR_LCT_UpdateRttPrediction(bbr_state, (double)rs->rtt_sample);
-    if (bbr_state->min_rtt > PICOQUIC_MINRTT_THRESHOLD &&
-        bbr_state->rtt_predicted > bbr_state->min_rtt) {
-        uint64_t delta_max = PICOQUIC_MINRTT_MARGIN + bbr_state->min_rtt / 4;
-        if (bbr_state->rtt_predicted > bbr_state->min_rtt + delta_max) {
-            bbr_state->nb_rtt_excess++;
-        }
-    }
 
 }
 
