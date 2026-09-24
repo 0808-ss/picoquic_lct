@@ -378,7 +378,7 @@ int picoquic_verify_path_available(picoquic_cnx_t* cnx, picoquic_path_t** next_p
  * Produce a sorting of available paths
  */
 
-void picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time, uint64_t* next_wake_time,
+void OLD_picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time, uint64_t* next_wake_time,
     picoquic_path_t** next_path, uint64_t min_retransmit, picoquic_tuple_t** next_tuple)
 {
     int data_path_cwin = -1;
@@ -485,6 +485,203 @@ void picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time, u
     }
     (*next_path)->selected++;
     *next_tuple = (*next_path)->first_tuple;
+}
+
+/* ============================================================
+ * Custom multipath scheduler framework (migrated from old env)
+ * ============================================================
+ *
+ * Scheduler selection: define exactly ONE of the following to 1.
+ *   - OLD:       original picoquic scheduler (renamed OLD_...)
+ *   - MINRTT:    minimum-RTT scheduler (self-written)
+ *   - RR:        round-robin scheduler (self-written)
+ *   - DAMS:      DAMS scheduler (NOT migrated yet - reserved)
+ *   - CELLFUSION:CELLFUSION scheduler (NOT implemented yet - reserved)
+ *   - LCTDAMS:   LCT-DAMS scheduler (NOT migrated yet - reserved)
+ *
+ * DAMS / LCTDAMS / CELLFUSION functions are not present in this file yet.
+ * Keep their switch set to 0; flip to 1 only after porting the function
+ * and its state types from the old environment.
+ */
+
+#define MULTIPATH_SCHEDULER_OLD 0
+#define MULTIPATH_SCHEDULER_MINRTT 1
+#define MULTIPATH_SCHEDULER_RR 0
+#define MULTIPATH_SCHEDULER_DAMS 0
+#define MULTIPATH_SCHEDULER_CELLFUSION 0
+#define MULTIPATH_SCHEDULER_LCTDAMS 0
+
+void MINRTT_picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time, uint64_t* next_wake_time,
+    picoquic_path_t** next_path, uint64_t min_retransmit, picoquic_tuple_t** next_tuple)
+{
+    int data_path_cwin = -1;
+    int data_path_pacing = -1;
+    uint64_t pacing_time_next = UINT64_MAX;
+    uint64_t min_rtt_pacing = UINT64_MAX;
+    uint64_t min_rtt_cwin = UINT64_MAX;
+    int i_min_rtt = -1;
+    int is_min_rtt_pacing_ok = 0;
+    int is_ack_needed = 0;
+    picoquic_stream_head_t* next_stream = picoquic_find_ready_stream(cnx);
+    int affinity_path_id = -1;
+
+    for (int path_index = 0; path_index < cnx->nb_paths; path_index++) {
+        picoquic_path_t* path_x = cnx->path[path_index];
+        path_x->is_nominal_ack_path = 0;
+        
+        if (path_x->path_is_backup || !path_x->first_tuple->challenge_verified || path_x->path_is_demoted || path_x->nb_retransmit > min_retransmit) {
+            continue;
+        }
+        
+        if (i_min_rtt < 0 ||
+            path_x->nb_retransmit < cnx->path[i_min_rtt]->nb_retransmit ||
+            (path_x->nb_retransmit == cnx->path[i_min_rtt]->nb_retransmit &&
+                path_x->rtt_min < cnx->path[i_min_rtt]->rtt_min)) {
+            i_min_rtt = path_index;
+            is_min_rtt_pacing_ok = 0;
+        }
+        path_x->polled++;
+
+        if (picoquic_is_sending_authorized_by_pacing(cnx, path_x, current_time, &pacing_time_next)) {
+            if (path_x->rtt_min < min_rtt_pacing) {
+                min_rtt_pacing = path_x->rtt_min;
+                data_path_pacing = path_index;
+                if (path_index == i_min_rtt) {
+                    is_min_rtt_pacing_ok = 1;
+                }
+            }
+            if (path_x->bytes_in_transit < path_x->cwin &&
+                path_x->bytes_in_transit < cnx->quic->cwin_max) {
+                if (path_x->rtt_min < min_rtt_cwin) {
+                    min_rtt_cwin = path_x->rtt_min;
+                    data_path_cwin = path_index;
+                }
+                if (affinity_path_id < 0) {
+                    if (next_stream != NULL && path_x == next_stream->affinity_path) {
+                        affinity_path_id = path_index;
+                    }
+                    else if (path_x->is_datagram_ready || cnx->is_datagram_ready) {
+                        affinity_path_id = path_index;
+                    }
+                }
+            }
+            else {
+                path_x->congested++;
+            }
+        }
+        else {
+            path_x->paced++;
+        }
+    }
+
+    if (i_min_rtt >= 0) {
+        is_ack_needed = picoquic_is_ack_needed(cnx, current_time, next_wake_time, 0, 0);
+        cnx->path[i_min_rtt]->is_nominal_ack_path = 1;
+    }
+
+    if (is_ack_needed && is_min_rtt_pacing_ok) {
+        *next_path = cnx->path[i_min_rtt];
+    }
+    else if (data_path_cwin >= 0) {
+        if (affinity_path_id >= 0) {
+            *next_path = cnx->path[affinity_path_id];
+        }
+        else {
+            *next_path = cnx->path[data_path_cwin];
+        }
+    }
+    else if (data_path_pacing >= 0) {
+        *next_path = cnx->path[data_path_pacing];
+    }
+    else {
+        if (pacing_time_next < *next_wake_time) {
+            *next_wake_time = pacing_time_next;
+            SET_LAST_WAKE(cnx->quic, PICOQUIC_SENDER);
+        }
+        *next_path = cnx->path[0];
+    }
+    (*next_path)->selected++;
+    *next_tuple = (*next_path)->first_tuple;
+}
+
+void RR_picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time, uint64_t* next_wake_time,
+    picoquic_path_t** next_path, uint64_t min_retransmit, picoquic_tuple_t** next_tuple)
+{
+    uint64_t min_selected = UINT64_MAX;
+    uint64_t pacing_time_next = UINT64_MAX;
+    uint64_t min_pacing_time = UINT64_MAX;
+    int best_path_index = -1;
+
+    for (int path_index = 0; path_index < cnx->nb_paths; path_index++) {
+        picoquic_path_t* path_x = cnx->path[path_index];
+        path_x->is_nominal_ack_path = 0;
+        
+        if (path_x->path_is_backup || !path_x->first_tuple->challenge_verified || path_x->path_is_demoted || path_x->nb_retransmit > min_retransmit) {
+            continue;
+        }
+        
+        path_x->polled++;
+
+        if (picoquic_is_sending_authorized_by_pacing(cnx, path_x, current_time, &pacing_time_next)) {
+            if (path_x->bytes_in_transit < path_x->cwin &&
+                path_x->bytes_in_transit < cnx->quic->cwin_max) {
+                if (path_x->selected < min_selected) {
+                    min_selected = path_x->selected;
+                    best_path_index = path_index;
+                }
+            }
+            else {
+                path_x->congested++;
+            }
+        }
+        else {
+            path_x->paced++;
+            if (pacing_time_next < min_pacing_time) {
+                min_pacing_time = pacing_time_next;
+            }
+        }
+    }
+
+    if (best_path_index >= 0) {
+        *next_path = cnx->path[best_path_index];
+    }
+    else {
+        if (min_pacing_time != UINT64_MAX && min_pacing_time < *next_wake_time) {
+            *next_wake_time = min_pacing_time;
+            SET_LAST_WAKE(cnx->quic, PICOQUIC_SENDER);
+        }
+        *next_path = cnx->path[0];
+    }
+    (*next_path)->selected++;
+    *next_tuple = (*next_path)->first_tuple;
+}
+
+void picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time, uint64_t* next_wake_time,
+    picoquic_path_t** next_path, uint64_t min_retransmit, picoquic_tuple_t** next_tuple)
+{
+#if MULTIPATH_SCHEDULER_OLD
+    OLD_picoquic_sort_available_paths(cnx, current_time, next_wake_time, next_path, min_retransmit, next_tuple);
+#elif MULTIPATH_SCHEDULER_MINRTT
+    MINRTT_picoquic_sort_available_paths(cnx, current_time, next_wake_time, next_path, min_retransmit, next_tuple);
+#elif MULTIPATH_SCHEDULER_RR
+    RR_picoquic_sort_available_paths(cnx, current_time, next_wake_time, next_path, min_retransmit, next_tuple);
+#elif MULTIPATH_SCHEDULER_DAMS
+    /* NOT MIGRATED YET: port DAMS_picoquic_sort_available_paths + dams_path_state_t before enabling */
+    DAMS_picoquic_sort_available_paths(cnx, current_time, next_wake_time, next_path, min_retransmit, next_tuple);
+#elif MULTIPATH_SCHEDULER_CELLFUSION
+    /* NOT IMPLEMENTED: port CELLFUSION_picoquic_sort_available_paths + cellfusion_path_state_t before enabling */
+    CELLFUSION_picoquic_sort_available_paths(cnx, current_time, next_wake_time, next_path, min_retransmit, next_tuple);
+#elif MULTIPATH_SCHEDULER_LCTDAMS
+    /* NOT MIGRATED YET: port LCTDAMS_picoquic_sort_available_paths + lctdams_path_state_t before enabling */
+    LCTDAMS_picoquic_sort_available_paths(cnx, current_time, next_wake_time, next_path, min_retransmit, next_tuple);
+#else
+    /* 
+     * Default placeholder implementation (always picks path 0):
+     */
+    *next_path = cnx->path[0];
+    (*next_path)->selected++;
+    *next_tuple = (*next_path)->first_tuple;
+#endif
 }
 
 /*
