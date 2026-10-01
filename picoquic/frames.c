@@ -261,6 +261,12 @@ void picoquic_enforce_reset_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_he
         picoquic_stream_queue_node_t* not_needed = next;
         next = next->next_stream_data;
 
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+        if (cnx->is_iframe_preemption_enabled) {
+            /* Design v2: keep connection-level class queue coherent */
+            picoquic_dequeue_class_node(cnx, not_needed);
+        }
+#endif
         if (not_needed->bytes != NULL) {
             free(not_needed->bytes);
         }
@@ -1551,7 +1557,27 @@ picoquic_stream_head_t* picoquic_find_ready_stream_path(picoquic_cnx_t* cnx, pic
     picoquic_stream_head_t* first_stream = cnx->first_output_stream;
     picoquic_stream_head_t* stream = first_stream;
     picoquic_stream_head_t* found_stream = NULL;
-
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+    /* Design v2 -- L2 pre-scan: is there any ready stream whose send_queue
+     * head is an I frame and that can actually send now (flow control)? Only
+     * then do BP-frame streams fully yield. */
+    int l2_iframe_head_sendable = 0;
+    if (cnx->is_iframe_preemption_enabled && cnx->preempt_enable_l2_stream &&
+        cnx->is_iframe_pending) {
+        picoquic_stream_head_t* scan = first_stream;
+        while (scan != NULL && !l2_iframe_head_sendable) {
+            if (scan->send_queue != NULL &&
+                scan->send_queue->length > scan->send_queue->offset &&
+                scan->send_queue->frame_class == picoquic_frame_class_i &&
+                cnx->maxdata_remote > cnx->data_sent &&
+                scan->sent_offset < scan->maxdata_remote &&
+                (path_x == NULL || scan->affinity_path == NULL || scan->affinity_path == path_x)) {
+                l2_iframe_head_sendable = 1;
+            }
+            scan = scan->next_output_stream;
+        }
+    }
+#endif
 
     /* Look for a ready stream */
     while (stream != NULL) {
@@ -1604,6 +1630,21 @@ picoquic_stream_head_t* picoquic_find_ready_stream_path(picoquic_cnx_t* cnx, pic
             /* Only consider the streams that meet path affinity requirements */
             has_data = 0;
         }
+
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+        /* Design v2 -- stream-level preemption (L2): while I-frame data is
+         * pending and at least one ready stream has an I frame at the head of
+         * its send_queue, only I-head streams qualify; BP-frame streams fully
+         * yield (D2). If no I head is currently sendable (blocked by in-stream
+         * order or flow control), BP streams are not filtered out, so data
+         * keeps flowing. Controlled by cnx->preempt_enable_l2_stream. */
+        if (has_data && cnx->is_iframe_preemption_enabled && cnx->preempt_enable_l2_stream &&
+            cnx->is_iframe_pending && !l2_iframe_head_sendable &&
+            !(stream->send_queue != NULL && stream->send_queue->length > stream->send_queue->offset &&
+              stream->send_queue->frame_class == picoquic_frame_class_i)) {
+            has_data = 0;
+        }
+#endif
         
         if (has_data) {
             /* Check that this stream is actually available for sending data */
@@ -1864,6 +1905,57 @@ uint8_t* picoquic_format_stream_frame_header(uint8_t* bytes, uint8_t* bytes_max,
     return bytes;
 }
 
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+/* Design v2 -- remove a stream data node from the connection-level I/BP class
+ * queue once it is consumed from the stream send queue (or dropped). Keeps the
+ * class queue pointers and byte counters coherent. Called right before the
+ * node is freed, so the node itself must still be valid. */
+void picoquic_dequeue_class_node(picoquic_cnx_t* cnx, picoquic_stream_queue_node_t* node)
+{
+    picoquic_stream_queue_node_t** pfirst = NULL;
+    picoquic_stream_queue_node_t** plast = NULL;
+    uint64_t* pbytes = NULL;
+
+    if (node->frame_class == picoquic_frame_class_i) {
+        pfirst = &cnx->first_iframe_data;
+        plast = &cnx->last_iframe_data;
+        pbytes = &cnx->nb_iframe_bytes_queued;
+    }
+    else {
+        pfirst = &cnx->first_bpframe_data;
+        plast = &cnx->last_bpframe_data;
+        pbytes = &cnx->nb_bpframe_bytes_queued;
+    }
+
+    if (*pfirst != NULL) {
+        if (*pfirst == node) {
+            *pfirst = node->next_class_data;
+            if (*plast == node) {
+                *plast = *pfirst;
+            }
+        }
+        else {
+            picoquic_stream_queue_node_t* cur = *pfirst;
+            while (cur->next_class_data != NULL && cur->next_class_data != node) {
+                cur = cur->next_class_data;
+            }
+            if (cur->next_class_data == node) {
+                cur->next_class_data = node->next_class_data;
+                if (*plast == node) {
+                    *plast = cur;
+                }
+            }
+        }
+        if (*pbytes >= node->length) {
+            *pbytes -= node->length;
+        }
+        if (*pfirst == NULL) {
+            cnx->is_iframe_pending = 0;
+        }
+    }
+}
+#endif /* PICOQUIC_IFRAME_PREEMPTION_SUPPORTED */
+
 uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream,
     uint8_t* bytes, uint8_t* bytes_max, int * more_data, int * is_pure_ack, int* is_still_active, int * ret)
 {
@@ -2018,6 +2110,12 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
 
                     stream->send_queue->offset += length;
                     if (stream->send_queue->offset >= stream->send_queue->length) {
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+                        if (cnx->is_iframe_preemption_enabled) {
+                            /* Design v2: keep connection-level class queue coherent */
+                            picoquic_dequeue_class_node(cnx, stream->send_queue);
+                        }
+#endif
                         picoquic_stream_queue_node_t* next = stream->send_queue->next_stream_data;
                         free(stream->send_queue->bytes);
                         free(stream->send_queue);
@@ -2105,6 +2203,94 @@ uint8_t* picoquic_format_available_stream_frames(picoquic_cnx_t* cnx, picoquic_p
 
     return bytes_next;
 }
+
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+/* Design v2 -- find a ready stream whose send_queue head node carries the
+ * given frame class. Only streams that can actually send data (flow control,
+ * affinity) qualify, mirroring picoquic_find_ready_stream_path. Used by
+ * packet-level preemption (L1) and stream-level preemption (L2).
+ */
+static picoquic_stream_head_t* picoquic_find_ready_class_stream_path(picoquic_cnx_t* cnx,
+    picoquic_path_t* path_x, picoquic_frame_class_enum frame_class)
+{
+    picoquic_stream_head_t* stream = cnx->first_output_stream;
+    picoquic_stream_head_t* found_stream = NULL;
+
+    while (stream != NULL) {
+        picoquic_stream_head_t* next_stream = stream->next_output_stream;
+        int has_data = 0;
+
+        /* Only streams whose send_queue head is of the requested class qualify. */
+        if (stream->send_queue != NULL &&
+            stream->send_queue->length > stream->send_queue->offset &&
+            stream->send_queue->frame_class == frame_class) {
+            has_data = 1;
+        }
+
+        /* Same flow-control tests as in picoquic_find_ready_stream_path. */
+        if (has_data &&
+            (cnx->maxdata_remote <= cnx->data_sent || stream->sent_offset >= stream->maxdata_remote)) {
+            has_data = 0;
+        }
+
+        /* Affinity scheduling */
+        if (has_data && path_x != NULL && stream->affinity_path != path_x && stream->affinity_path != NULL) {
+            has_data = 0;
+        }
+
+        if (has_data) {
+            found_stream = stream;
+            break;
+        }
+        stream = next_stream;
+    }
+
+    return found_stream;
+}
+
+/* Design v2 -- format stream frames exclusively from the connection-level
+ * queue of the given frame class. Only nodes tagged "frame_class" are
+ * consumed; a node is served only when it is at the head of its stream send
+ * queue (stream order preserved). This implements packet-level preemption:
+ * when called with picoquic_frame_class_i while I-frame data is pending, the
+ * packet is filled with I-frame data only. */
+uint8_t* picoquic_format_class_stream_frames(picoquic_cnx_t* cnx, picoquic_path_t * path_x,
+    uint8_t* bytes_next, uint8_t* bytes_max, picoquic_frame_class_enum frame_class,
+    int* more_data, int* is_pure_ack, int* stream_tried_and_failed, int* ret)
+{
+    uint8_t* bytes_previous = bytes_next;
+    picoquic_stream_head_t* stream = picoquic_find_ready_class_stream_path(cnx,
+        (cnx->is_multipath_enabled) ? path_x : NULL, frame_class);
+    int more_class_data = 0;
+
+    while (*ret == 0 && stream != NULL && bytes_next < bytes_max) {
+        int is_still_active = 0;
+        uint8_t* bytes_before = bytes_next;
+        bytes_next = picoquic_format_stream_frame(cnx, stream, bytes_next, bytes_max,
+            &more_class_data, is_pure_ack, &is_still_active, ret);
+
+        /* Continue with the next class-matching stream, unless coalescing
+         * restrictions apply or nothing was formatted. */
+        if (*ret == 0 && !stream->is_not_coalesced) {
+            if (bytes_next == bytes_before) {
+                /* No progress (e.g., reset sent or packet full): stop to
+                 * avoid an infinite loop on the same stream. */
+                break;
+            }
+            stream = picoquic_find_ready_class_stream_path(cnx,
+                (cnx->is_multipath_enabled) ? path_x : NULL, frame_class);
+        }
+        else {
+            break;
+        }
+    }
+
+    *stream_tried_and_failed = (!more_class_data && bytes_next == bytes_previous);
+    *more_data |= more_class_data;
+
+    return bytes_next;
+}
+#endif /* PICOQUIC_IFRAME_PREEMPTION_SUPPORTED */
 
 /* Organize the queue of packets containing stream data as a splay.
 * TODO: replace cnx->data_repeat_last and cnx->data_repeat_first by
@@ -2213,6 +2399,19 @@ int picoquic_queue_data_repeat_adjust(picoquic_cnx_t* cnx, picoquic_packet_t* pa
                 }
                 else {
                     packet->data_repeat_priority = stream->stream_priority;
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+                    /* Design v2 -- I-frame retransmission priority (D2):
+                     * when the stream send_queue head is an I frame (I-frame
+                     * data is being produced), its repeats are promoted to
+                     * the highest priority so they preempt BP-frame repeats.
+                     * Controlled by preempt_enable_l1_packet for ablation. */
+                    if (cnx->is_iframe_preemption_enabled && cnx->preempt_enable_l1_packet &&
+                        stream->send_queue != NULL &&
+                        stream->send_queue->length > stream->send_queue->offset &&
+                        stream->send_queue->frame_class == picoquic_frame_class_i) {
+                        packet->data_repeat_priority = 0;
+                    }
+#endif
                 }
             }
             else {
@@ -2672,6 +2871,12 @@ uint8_t* picoquic_format_crypto_hs_frame(picoquic_stream_head_t* stream, uint8_t
 
                     stream->send_queue->offset += length;
                     if (stream->send_queue->offset >= stream->send_queue->length) {
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+                        if (cnx->is_iframe_preemption_enabled) {
+                            /* Design v2: keep connection-level class queue coherent */
+                            picoquic_dequeue_class_node(cnx, stream->send_queue);
+                        }
+#endif
                         picoquic_stream_queue_node_t* next = stream->send_queue->next_stream_data;
                         free(stream->send_queue->bytes);
                         free(stream->send_queue);

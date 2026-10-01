@@ -3369,6 +3369,12 @@ void picoquic_clear_stream(picoquic_stream_head_t* stream)
 
     while ((next = ready) != NULL) {
         ready = next->next_stream_data;
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+        if (stream->cnx != NULL && stream->cnx->is_iframe_preemption_enabled) {
+            /* Design v2: keep connection-level class queue coherent */
+            picoquic_dequeue_class_node(stream->cnx, next);
+        }
+#endif
         if (next->bytes != NULL) {
             free(next->bytes);
         }

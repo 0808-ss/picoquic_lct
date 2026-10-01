@@ -2157,6 +2157,12 @@ static int picoquic_add_to_tls_stream(picoquic_cnx_t* cnx, const uint8_t* data, 
                 stream_data->length = length;
                 stream_data->offset = 0;
                 stream_data->next_stream_data = NULL;
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+                /* TLS stream data never joins the I/BP class queues, but the
+                 * class tag must be valid (dequeue helpers may inspect it). */
+                stream_data->frame_class = picoquic_frame_class_bp;
+                stream_data->next_class_data = NULL;
+#endif
 
                 while (next != NULL) {
                     pprevious = &next->next_stream_data;

@@ -1481,6 +1481,46 @@ void picoquic_reset_stream_ctx(picoquic_cnx_t* cnx, uint64_t stream_id);
  */
 int picoquic_add_to_stream_with_ctx(picoquic_cnx_t * cnx, uint64_t stream_id, const uint8_t * data, size_t length, int set_fin, void * app_stream_ctx);
 
+/* --- I/BP frame class extension (design v2) ---
+ * Video frame class for queued stream data. The application tags each
+ * chunk of stream data as either an I frame (key frame) or a BP frame
+ * (P/B predicted frame). Picoquic maintains two connection-level queues
+ * and, when enabled, performs packet-level preemption: while I-frame data
+ * is pending, outgoing packets carry only I-frame data and BP-frame data
+ * fully yields.
+ *
+ * Compile-time master switch: set to 0 to strip the whole mechanism.
+ */
+#ifndef PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+#define PICOQUIC_IFRAME_PREEMPTION_SUPPORTED 1
+#endif
+
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+typedef enum {
+    picoquic_frame_class_bp = 0,   /* BP frame (P/B predicted frame) */
+    picoquic_frame_class_i  = 1    /* I frame (intra/key frame) */
+} picoquic_frame_class_enum;
+
+/* Same as "picoquic_add_to_stream_with_ctx", but also tags the queued data
+ * with a video frame class. The data chunk is chained both in the stream
+ * send queue (keeping stream order / flow control / retransmission semantics)
+ * and in the connection-level I-frame or BP-frame queue used for preemption
+ * scheduling. The original API keeps behaving as before (frame class BP).
+ */
+int picoquic_add_to_stream_with_ctx_ex(picoquic_cnx_t * cnx, uint64_t stream_id, const uint8_t * data, size_t length, int set_fin, void * app_stream_ctx, picoquic_frame_class_enum frame_class);
+
+/* Configure the I-frame preemption mechanism at runtime (ablation support).
+ * - enabled: master runtime switch. 0 restores baseline behavior.
+ * - l1: packet-level preemption (BP fully yields while I frames are pending).
+ * - l2: stream-level selection favors streams whose head is an I frame.
+ * - l3: path-level preemption gives the best path to I frames.
+ * - l4: congestion window preemption, bounded per RTT by burst_max packets.
+ * - burst_max: per-RTT preemption quota for l4 (packets). 0 disables l4.
+ */
+void picoquic_set_iframe_preemption_config(picoquic_cnx_t* cnx,
+    int enabled, int l1, int l2, int l3, int l4, uint32_t burst_max);
+#endif /* PICOQUIC_IFRAME_PREEMPTION_SUPPORTED */
+
 /* Reset a stream, indicating that no more data will be sent on 
  * that stream and that any data currently queued can be abandoned. */
 int picoquic_reset_stream(picoquic_cnx_t* cnx,

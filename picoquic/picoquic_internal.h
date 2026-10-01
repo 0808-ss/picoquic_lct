@@ -370,10 +370,14 @@ typedef struct st_picoquic_stream_data_node_t {
 /* Data structure used to hold chunk of stream data queued by application */
 typedef struct st_picoquic_stream_queue_node_t {
     picoquic_quic_t* quic;
-    struct st_picoquic_stream_queue_node_t* next_stream_data;
+    struct st_picoquic_stream_queue_node_t* next_stream_data;   /* stream send queue link */
+    struct st_picoquic_stream_queue_node_t* next_class_data;    /* connection-level I/BP class queue link (design v2) */
     uint64_t offset;  /* Stream offset of the first octet in "bytes" */
     size_t length;    /* Number of octets in "bytes" */
     uint8_t* bytes;
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+    picoquic_frame_class_enum frame_class; /* I/BP frame class tag (design v2) */
+#endif
 } picoquic_stream_queue_node_t;
 
 /*
@@ -1478,6 +1482,32 @@ typedef struct st_picoquic_cnx_t {
     int datagram_conflicts_count;
     int datagram_conflicts_max;
 
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+    /* --- I/BP frame dual queues (design v2) ---
+     * Connection-level queues of stream data chunks tagged by frame class.
+     * Chunks are also chained in their stream send_queue (stream order,
+     * flow control and retransmission semantics unchanged); the class
+     * queues are only used for preemption scheduling.
+     */
+    picoquic_stream_queue_node_t* first_iframe_data;   /* I frame data queue head */
+    picoquic_stream_queue_node_t* last_iframe_data;    /* I frame data queue tail */
+    picoquic_stream_queue_node_t* first_bpframe_data;  /* BP frame data queue head */
+    picoquic_stream_queue_node_t* last_bpframe_data;   /* BP frame data queue tail */
+    uint64_t nb_iframe_bytes_queued;                   /* queued I frame bytes (stats only, no cap) */
+    uint64_t nb_bpframe_bytes_queued;                  /* queued BP frame bytes (stats only, no cap) */
+    unsigned int is_iframe_pending : 1;                /* I queue non-empty: used for path/CC preemption */
+
+    /* --- Mechanism switches (design v2, ablation support) --- */
+    unsigned int is_iframe_preemption_enabled : 1;     /* runtime master switch, 0 = baseline */
+    unsigned int preempt_enable_l1_packet : 1;         /* packet-level preemption */
+    unsigned int preempt_enable_l2_stream : 1;         /* stream-level selection */
+    unsigned int preempt_enable_l3_path : 1;           /* path-level preemption */
+    unsigned int preempt_enable_l4_cwin : 1;           /* CC window preemption */
+    uint32_t iframe_cwin_preempt_burst_max;            /* L4 per-RTT burst quota (packets); 0 disables L4 */
+    uint32_t iframe_cwin_preempt_remaining;            /* remaining quota in current RTT (internal) */
+    uint64_t last_cwin_preempt_reset_time;             /* time of last quota reset (internal) */
+#endif /* PICOQUIC_IFRAME_PREEMPTION_SUPPORTED */
+
     /* If not `0`, the connection will send keep alive messages in the given interval. */
     uint64_t keep_alive_interval;
 
@@ -1925,6 +1955,29 @@ int picoquic_check_frame_needs_repeat(picoquic_cnx_t* cnx, const uint8_t* bytes,
 uint8_t* picoquic_format_available_stream_frames(picoquic_cnx_t* cnx, picoquic_path_t * path_x,
     uint8_t* bytes_next, uint8_t* bytes_max, uint64_t current_priority,
     int* more_data, int* is_pure_ack, int* stream_tried_and_failed, int* ret);
+
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+/* Format stream frames from the connection-level queue of the given frame
+ * class (I or BP). Only nodes tagged with "frame_class" are consumed; nodes
+ * are removed from both the connection-level class queue and the stream
+ * send queue, so stream order / flow control / retransmission semantics
+ * are preserved. Used by packet-level preemption (design v2).
+ */
+uint8_t* picoquic_format_class_stream_frames(picoquic_cnx_t* cnx, picoquic_path_t * path_x,
+    uint8_t* bytes_next, uint8_t* bytes_max, picoquic_frame_class_enum frame_class,
+    int* more_data, int* is_pure_ack, int* stream_tried_and_failed, int* ret);
+
+/* Remove a stream data node from the connection-level I/BP class queue.
+ * Called right before the node is freed. Keeps class queue pointers and
+ * byte counters coherent (design v2). */
+void picoquic_dequeue_class_node(picoquic_cnx_t* cnx, picoquic_stream_queue_node_t* node);
+
+/* Enqueue a stream data chunk into both the stream send queue and the
+ * connection-level I/BP class queue (design v2). */
+int picoquic_add_to_stream_with_ctx_internal(picoquic_cnx_t* cnx, uint64_t stream_id,
+    const uint8_t* data, size_t length, int set_fin, void* app_stream_ctx,
+    picoquic_frame_class_enum frame_class);
+#endif /* PICOQUIC_IFRAME_PREEMPTION_SUPPORTED */
 
 /* Handling of stream_data_frames that need repeating.
  */

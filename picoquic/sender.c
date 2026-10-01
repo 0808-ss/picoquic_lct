@@ -225,8 +225,14 @@ int picoquic_mark_high_priority_stream(picoquic_cnx_t * cnx, uint64_t stream_id,
     return ret;
 }
 
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+int picoquic_add_to_stream_with_ctx_internal(picoquic_cnx_t* cnx, uint64_t stream_id,
+    const uint8_t* data, size_t length, int set_fin, void * app_stream_ctx,
+    picoquic_frame_class_enum frame_class)
+#else
 int picoquic_add_to_stream_with_ctx(picoquic_cnx_t* cnx, uint64_t stream_id,
     const uint8_t* data, size_t length, int set_fin, void * app_stream_ctx)
+#endif
 {
     int ret = 0;
     picoquic_stream_head_t* stream = picoquic_find_stream_for_writing(cnx, stream_id, &ret);
@@ -267,6 +273,13 @@ int picoquic_add_to_stream_with_ctx(picoquic_cnx_t* cnx, uint64_t stream_id,
                 stream_data->length = length;
                 stream_data->offset = 0;
                 stream_data->next_stream_data = NULL;
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+                /* Always tag the node; the class queues are only maintained
+                 * while the mechanism is enabled, but the tag itself must be
+                 * valid even if preemption is toggled on later (ablation). */
+                stream_data->frame_class = frame_class;
+                stream_data->next_class_data = NULL;
+#endif
 
                 while (next != NULL) {
                     pprevious = &next->next_stream_data;
@@ -274,6 +287,33 @@ int picoquic_add_to_stream_with_ctx(picoquic_cnx_t* cnx, uint64_t stream_id,
                 }
 
                 *pprevious = stream_data;
+
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+                /* Design v2: also chain into the connection-level class queue
+                 * when the mechanism is enabled. Stream order / flow control /
+                 * retransmission semantics remain anchored in the stream queue;
+                 * the class queue is only used for preemption scheduling. */
+                if (cnx->is_iframe_preemption_enabled) {
+                    if (frame_class == picoquic_frame_class_i) {
+                        if (cnx->last_iframe_data == NULL) {
+                            cnx->first_iframe_data = stream_data;
+                        } else {
+                            cnx->last_iframe_data->next_class_data = stream_data;
+                        }
+                        cnx->last_iframe_data = stream_data;
+                        cnx->nb_iframe_bytes_queued += length;
+                        cnx->is_iframe_pending = 1;
+                    } else {
+                        if (cnx->last_bpframe_data == NULL) {
+                            cnx->first_bpframe_data = stream_data;
+                        } else {
+                            cnx->last_bpframe_data->next_class_data = stream_data;
+                        }
+                        cnx->last_bpframe_data = stream_data;
+                        cnx->nb_bpframe_bytes_queued += length;
+                    }
+                }
+#endif
             }
         }
 
@@ -288,6 +328,45 @@ int picoquic_add_to_stream_with_ctx(picoquic_cnx_t* cnx, uint64_t stream_id,
 
     return ret;
 }
+
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+int picoquic_add_to_stream_with_ctx(picoquic_cnx_t* cnx, uint64_t stream_id,
+    const uint8_t* data, size_t length, int set_fin, void * app_stream_ctx)
+{
+    return picoquic_add_to_stream_with_ctx_internal(cnx, stream_id, data, length, set_fin, app_stream_ctx, picoquic_frame_class_bp);
+}
+
+int picoquic_add_to_stream_with_ctx_ex(picoquic_cnx_t* cnx, uint64_t stream_id,
+    const uint8_t* data, size_t length, int set_fin, void * app_stream_ctx,
+    picoquic_frame_class_enum frame_class)
+{
+    return picoquic_add_to_stream_with_ctx_internal(cnx, stream_id, data, length, set_fin, app_stream_ctx, frame_class);
+}
+
+void picoquic_set_iframe_preemption_config(picoquic_cnx_t* cnx,
+    int enabled, int l1, int l2, int l3, int l4, uint32_t burst_max)
+{
+    if (cnx != NULL) {
+        cnx->is_iframe_preemption_enabled = (enabled != 0);
+        cnx->preempt_enable_l1_packet = (l1 != 0);
+        cnx->preempt_enable_l2_stream = (l2 != 0);
+        cnx->preempt_enable_l3_path = (l3 != 0);
+        cnx->preempt_enable_l4_cwin = (l4 != 0);
+        cnx->iframe_cwin_preempt_burst_max = burst_max;
+        cnx->iframe_cwin_preempt_remaining = 0;
+        if (!cnx->is_iframe_preemption_enabled) {
+            /* Reset class queues when disabling, so re-enabling starts clean. */
+            cnx->first_iframe_data = NULL;
+            cnx->last_iframe_data = NULL;
+            cnx->first_bpframe_data = NULL;
+            cnx->last_bpframe_data = NULL;
+            cnx->nb_iframe_bytes_queued = 0;
+            cnx->nb_bpframe_bytes_queued = 0;
+            cnx->is_iframe_pending = 0;
+        }
+    }
+}
+#endif /* PICOQUIC_IFRAME_PREEMPTION_SUPPORTED */
 
 int picoquic_add_to_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
     const uint8_t* data, size_t length, int set_fin)
@@ -2826,6 +2905,45 @@ static uint8_t* picoquic_prepare_stream_and_datagrams(picoquic_cnx_t* cnx, picoq
     int more_data_this_round = 0;
     int is_first_round = 1;
 
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+    /* Design v2 -- packet-level preemption (L1, D2/D7):
+     * while I-frame data is pending, this packet carries ONLY I-frame data;
+     * BP frames, datagrams and data repeats fully yield. The loop below keeps
+     * serving the I queue across packets until it is drained (or the quota /
+     * flow control prevents more), then normal mixed scheduling resumes. */
+    if (cnx->is_iframe_preemption_enabled && cnx->preempt_enable_l1_packet &&
+        cnx->first_iframe_data != NULL) {
+        int more_iframe_this_round = 0;
+        int iframe_tried_and_failed = 0;
+        uint8_t* bytes_first = bytes_next;
+        int iframe_preempt_had_progress = 0;
+
+        while (bytes_next + 8 < bytes_max && *ret == 0 && cnx->first_iframe_data != NULL) {
+            bytes_next = picoquic_format_class_stream_frames(cnx, path_x, bytes_next, bytes_max,
+                picoquic_frame_class_i, &more_iframe_this_round, is_pure_ack,
+                &iframe_tried_and_failed, ret);
+            if (bytes_next == bytes_first) {
+                /* Nothing could be formatted (e.g., I-frame head blocked by
+                 * in-stream order, flow control, or packet full): stop trying
+                 * in this packet. */
+                break;
+            }
+            iframe_preempt_had_progress = 1;
+            bytes_first = bytes_next;
+        }
+
+        if (iframe_preempt_had_progress) {
+            *more_data |= more_iframe_this_round;
+            if (is_first_round) {
+                *no_data_to_send = (cnx->first_iframe_data == NULL) && iframe_tried_and_failed;
+            }
+            return bytes_next;
+        }
+        /* No progress: fall through to normal mixed scheduling, so data keeps
+         * flowing (e.g. in-stream order requires draining BP first). */
+    }
+#endif /* PICOQUIC_IFRAME_PREEMPTION_SUPPORTED */
+
     while (bytes_next + 8 < bytes_max && *ret == 0) {
         /* Find the highest priority level for which there is something to send, then
         * format the frames to send at that level. Repeat in a loop until the
@@ -3430,6 +3548,37 @@ int picoquic_prepare_packet_ready(picoquic_cnx_t* cnx, picoquic_path_t* path_x, 
                     /* Implementation of experimental API, picoquic_set_priority_limit_for_bypass */
                     uint8_t* bytes_next_before_bypass = bytes_next;
                     int no_data_to_send = 0;
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+                    /* Design v2 -- CC window preemption (L4, D3):
+                     * while I-frame data is pending and the per-RTT preemption
+                     * quota is not exhausted, allow I-frame packets to bypass
+                     * the congestion window. Each successfully sent packet
+                     * consumes one unit of quota. */
+                    int iframe_preempt_now = 0;
+                    if (cnx->is_iframe_preemption_enabled && cnx->preempt_enable_l4_cwin &&
+                        cnx->is_iframe_pending) {
+                        uint64_t preempt_rtt = (cnx->path[0]->smoothed_rtt > 0) ?
+                            cnx->path[0]->smoothed_rtt : 0;
+                        if (preempt_rtt == 0 ||
+                            current_time - cnx->last_cwin_preempt_reset_time >= preempt_rtt) {
+                            /* Reset the quota once per RTT */
+                            cnx->iframe_cwin_preempt_remaining = cnx->iframe_cwin_preempt_burst_max;
+                            cnx->last_cwin_preempt_reset_time = current_time;
+                        }
+                        if (cnx->iframe_cwin_preempt_remaining > 0) {
+                            iframe_preempt_now = 1;
+                        }
+                    }
+                    if (iframe_preempt_now) {
+                        bytes_next = picoquic_prepare_stream_and_datagrams(cnx, path_x, bytes_next, bytes_max,
+                            (size_t)(bytes_next - bytes) <= packet->offset, UINT64_MAX, current_time,
+                            &more_data, &is_pure_ack, &no_data_to_send, &ret);
+                        if (bytes_next != bytes_next_before_bypass) {
+                            cnx->iframe_cwin_preempt_remaining--;
+                        }
+                    }
+                    else
+#endif /* PICOQUIC_IFRAME_PREEMPTION_SUPPORTED */
                     if (cnx->priority_limit_for_bypass > 0 && cnx->nb_paths == 1) {
                         bytes_next = picoquic_prepare_stream_and_datagrams(cnx, path_x, bytes_next, bytes_max,
                             (size_t)(bytes_next - bytes) <= packet->offset, cnx->priority_limit_for_bypass, current_time,
@@ -3581,6 +3730,23 @@ int picoquic_prepare_packet_ready(picoquic_cnx_t* cnx, picoquic_path_t* path_x, 
                     length = bytes_next - bytes;
                 }
             }
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+            /* Design v2 -- pacing bypass for I frames when preemption is on:
+             * if pacing blocks normal data but I-frame data is pending, let the
+             * packet-level preemption path fill the packet (BP/data yields).
+             * The CC-level quota is not consumed here (pacing bypass, not
+             * congestion bypass); use L4 switch for window preemption. */
+            else if (cnx->is_iframe_preemption_enabled && cnx->preempt_enable_l1_packet &&
+                cnx->first_iframe_data != NULL) {
+                int no_data_to_send = 0;
+
+                if ((bytes_next = picoquic_prepare_stream_and_datagrams(cnx, path_x, bytes_next, bytes_max,
+                    (size_t)(bytes_next - bytes) <= packet->offset, UINT64_MAX, current_time,
+                    &more_data, &is_pure_ack, &no_data_to_send, &ret)) != NULL) {
+                    length = bytes_next - bytes;
+                }
+            }
+#endif /* PICOQUIC_IFRAME_PREEMPTION_SUPPORTED */
         } /* End of challenge verified */
     }
 

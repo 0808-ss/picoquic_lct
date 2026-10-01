@@ -524,6 +524,13 @@ void MINRTT_picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_
     int is_ack_needed = 0;
     picoquic_stream_head_t* next_stream = picoquic_find_ready_stream(cnx);
     int affinity_path_id = -1;
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+    /* Design v2 -- path-level preemption (L3): while I-frame data is pending,
+     * skip path-affinity consideration (which would favor BP streams or
+     * datagrams) so that the min-RTT cwin-ready path is given to I frames. */
+    int iframe_l3_active = cnx->is_iframe_preemption_enabled &&
+        cnx->preempt_enable_l3_path && cnx->is_iframe_pending;
+#endif
 
     for (int path_index = 0; path_index < cnx->nb_paths; path_index++) {
         picoquic_path_t* path_x = cnx->path[path_index];
@@ -557,12 +564,18 @@ void MINRTT_picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_
                     data_path_cwin = path_index;
                 }
                 if (affinity_path_id < 0) {
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+                    if (!iframe_l3_active) {
+#endif
                     if (next_stream != NULL && path_x == next_stream->affinity_path) {
                         affinity_path_id = path_index;
                     }
                     else if (path_x->is_datagram_ready || cnx->is_datagram_ready) {
                         affinity_path_id = path_index;
                     }
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+                    }
+#endif
                 }
             }
             else {
@@ -583,6 +596,14 @@ void MINRTT_picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_
         *next_path = cnx->path[i_min_rtt];
     }
     else if (data_path_cwin >= 0) {
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+        if (iframe_l3_active) {
+            /* I-frame preemption: give the min-RTT cwin-ready path to I frames,
+             * overriding the affinity preference that would favor BP traffic. */
+            *next_path = cnx->path[data_path_cwin];
+        }
+        else
+#endif
         if (affinity_path_id >= 0) {
             *next_path = cnx->path[affinity_path_id];
         }
@@ -611,6 +632,14 @@ void RR_picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time
     uint64_t pacing_time_next = UINT64_MAX;
     uint64_t min_pacing_time = UINT64_MAX;
     int best_path_index = -1;
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+    /* Design v2 -- path-level preemption (L3) for RR: while I-frame data is
+     * pending, prefer the path with the best (lowest) rtt among cwin-ready
+     * paths, instead of a pure round-robin by selected count. */
+    int iframe_l3_active = cnx->is_iframe_preemption_enabled &&
+        cnx->preempt_enable_l3_path && cnx->is_iframe_pending;
+    uint64_t best_rtt = UINT64_MAX;
+#endif
 
     for (int path_index = 0; path_index < cnx->nb_paths; path_index++) {
         picoquic_path_t* path_x = cnx->path[path_index];
@@ -625,6 +654,20 @@ void RR_picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time
         if (picoquic_is_sending_authorized_by_pacing(cnx, path_x, current_time, &pacing_time_next)) {
             if (path_x->bytes_in_transit < path_x->cwin &&
                 path_x->bytes_in_transit < cnx->quic->cwin_max) {
+#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
+                if (iframe_l3_active) {
+                    /* I-frame preemption: pick the cwin-ready path with the
+                     * lowest rtt, breaking ties by selected count. */
+                    if (best_path_index < 0 ||
+                        path_x->rtt_min < best_rtt ||
+                        (path_x->rtt_min == best_rtt && path_x->selected < min_selected)) {
+                        best_rtt = path_x->rtt_min;
+                        min_selected = path_x->selected;
+                        best_path_index = path_index;
+                    }
+                }
+                else
+#endif
                 if (path_x->selected < min_selected) {
                     min_selected = path_x->selected;
                     best_path_index = path_index;
