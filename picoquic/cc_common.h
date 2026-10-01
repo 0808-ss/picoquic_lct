@@ -22,6 +22,9 @@
 #ifndef CC_COMMON_H
 #define CC_COMMON_H
 
+#include <stdint.h>
+#include "picoquic.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
