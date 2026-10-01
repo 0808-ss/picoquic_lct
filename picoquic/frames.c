@@ -2872,9 +2872,9 @@ uint8_t* picoquic_format_crypto_hs_frame(picoquic_stream_head_t* stream, uint8_t
                     stream->send_queue->offset += length;
                     if (stream->send_queue->offset >= stream->send_queue->length) {
 #if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
-                        if (cnx->is_iframe_preemption_enabled) {
+                        if (stream->cnx != NULL && stream->cnx->is_iframe_preemption_enabled) {
                             /* Design v2: keep connection-level class queue coherent */
-                            picoquic_dequeue_class_node(cnx, stream->send_queue);
+                            picoquic_dequeue_class_node(stream->cnx, stream->send_queue);
                         }
 #endif
                         picoquic_stream_queue_node_t* next = stream->send_queue->next_stream_data;
